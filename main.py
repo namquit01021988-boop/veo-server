@@ -458,11 +458,15 @@ def order_page(order_code: str):
         <p>Dùng email <b>{row["email"]}</b> và license key trên để đăng nhập tool.</p>
         """
     else:
-        license_html = """
+        license_html = f"""
         <p>Đơn hàng đang chờ thanh toán/xác nhận.</p>
         <p>Bước tiếp theo sẽ nối thanh toán tự động để key tự hiện sau khi chuyển khoản.</p>
         <p><b>Test nhanh:</b> bấm link dưới để giả lập đã thanh toán và tự cấp key.</p>
-        <div class="code"><a style="color:#22c55e;" href="/admin/pay/{order_code}" target="_blank">Giả lập thanh toán: /admin/pay/{order_code}</a></div>
+        <div class="code">
+            <a style="display:block;color:#22c55e;text-decoration:none;" href="/admin/pay/{order_code}" target="_blank">
+                👉 Giả lập thanh toán: /admin/pay/{order_code}
+            </a>
+        </div>
         """
 
     html = f"""
