@@ -566,13 +566,65 @@ def order_page(order_code: str):
 
     cur.execute("SELECT * FROM orders WHERE order_code = ?", (str(order_code),))
     row = cur.fetchone()
-    conn.close()
 
     if not row:
+        conn.close()
         return HTMLResponse("<h2>Không tìm thấy đơn hàng</h2>", status_code=404)
+
+    # =========================================================
+    # CHECK PAYOS REAL STATUS
+    # Nếu đơn đang pending, mỗi lần mở lại trang /order/{order_code}
+    # server sẽ hỏi payOS xem đơn đã PAID chưa.
+    # Nếu đã PAID -> tự đổi trạng thái paid + tự cấp license.
+    # =========================================================
+    if row["status"] != "paid":
+        try:
+            payos_client = get_payos_client()
+
+            payment_info = None
+
+            # Tương thích nhiều phiên bản SDK payOS
+            if hasattr(payos_client, "payment_requests"):
+                payment_info = payos_client.payment_requests.get(int(order_code))
+            elif hasattr(payos_client, "get_payment_link_information"):
+                payment_info = payos_client.get_payment_link_information(int(order_code))
+            elif hasattr(payos_client, "getPaymentLinkInformation"):
+                payment_info = payos_client.getPaymentLinkInformation(int(order_code))
+
+            payment_status = None
+
+            if payment_info:
+                payment_status = (
+                    getattr(payment_info, "status", None)
+                    or getattr(payment_info, "paymentLinkStatus", None)
+                )
+
+                if isinstance(payment_info, dict):
+                    payment_status = (
+                        payment_info.get("status")
+                        or payment_info.get("paymentLinkStatus")
+                        or payment_status
+                    )
+
+            if str(payment_status).upper() == "PAID":
+                mark_order_paid_and_create_license(str(order_code))
+
+                # Reload lại row sau khi đã cập nhật paid + license_key
+                conn = db()
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM orders WHERE order_code = ?", (str(order_code),))
+                row = cur.fetchone()
+
+        except Exception as e:
+            # Không làm crash trang order nếu payOS lỗi tạm thời.
+            print("PayOS status check error:", e)
+
+    conn.close()
 
     plan = PLAN_CONFIG.get(row["plan"], {})
     status = row["status"]
+
+    payment_html = ""
 
     if status == "paid" and row["license_key"]:
         payment_html = f"""
@@ -596,8 +648,8 @@ def order_page(order_code: str):
             <a class="btn gray" href="/order/{order_code}">Tôi đã thanh toán - kiểm tra lại</a>
         </p>
 
-        <p class="note">Sau khi payOS báo thanh toán thành công qua webhook, trang này sẽ hiện license key.</p>
-        <p class="note">Webhook cần cấu hình trong payOS: <b>{BASE_URL}/webhook/payos</b></p>
+        <p class="note">Sau khi thanh toán xong, bấm “Tôi đã thanh toán - kiểm tra lại”. Server sẽ tự hỏi payOS và tự cấp license.</p>
+        <p class="note">Webhook nếu cần dùng sau này: <b>{BASE_URL}/webhook/payos</b></p>
         """
 
     html = f"""
@@ -701,7 +753,6 @@ def order_page(order_code: str):
 </html>
 """
     return html
-
 
 @app.post("/webhook/payos")
 async def payos_webhook(request: Request):
