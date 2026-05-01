@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 import sqlite3
 import secrets
 from datetime import datetime, timedelta
@@ -7,7 +8,7 @@ app = FastAPI()
 
 DB = "veo_server.db"
 
-# ===== CONFIG NGÂN HÀNG =====
+# ===== CONFIG BANK =====
 BANK_ID = "MB"
 ACCOUNT_NO = "123456789"
 ACCOUNT_NAME = "NGUYEN VAN A"
@@ -57,9 +58,9 @@ PLANS = {
 
 
 # =====================
-# SHOP
+# SHOP (FIX Ở ĐÂY)
 # =====================
-@app.get("/shop")
+@app.get("/shop", response_class=HTMLResponse)
 def shop():
     return """
     <h2>Veo Tool - Mua gói</h2>
@@ -104,9 +105,9 @@ def create_order(email: str, plan: str):
 
 
 # =====================
-# VIEW ORDER + QR
+# VIEW ORDER (FIX HTML)
 # =====================
-@app.get("/order/{order_code}")
+@app.get("/order/{order_code}", response_class=HTMLResponse)
 def view_order(order_code: str):
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -115,11 +116,10 @@ def view_order(order_code: str):
     row = c.fetchone()
 
     if not row:
-        return {"error": "Không tìm thấy đơn"}
+        return "Không tìm thấy đơn"
 
     order_code, email, plan, amount, status = row
 
-    # QR VietQR
     qr_url = f"https://img.vietqr.io/image/{BANK_ID}-{ACCOUNT_NO}-compact.png?amount={amount}&addInfo={order_code}&accountName={ACCOUNT_NAME}"
 
     html = f"""
@@ -135,11 +135,7 @@ def view_order(order_code: str):
 
     <p><b>Nội dung chuyển khoản:</b> {order_code}</p>
 
-    <p>⏳ Sau khi chuyển khoản, bấm nút kiểm tra:</p>
-
-    <a href="/check_payment/{order_code}">
-    👉 Tôi đã chuyển khoản
-    </a>
+    <p><a href="/check_payment/{order_code}">👉 Tôi đã chuyển khoản</a></p>
     """
 
     if status == "paid":
@@ -147,17 +143,14 @@ def view_order(order_code: str):
         lic = c.fetchone()
 
         if lic:
-            html += f"""
-            <h3>🎉 License của bạn:</h3>
-            <p>{lic[1]}</p>
-            """
+            html += f"<h3>🎉 License: {lic[1]}</h3>"
 
     conn.close()
     return html
 
 
 # =====================
-# CHECK PAYMENT (GIẢ LẬP AUTO)
+# CHECK PAYMENT
 # =====================
 @app.get("/check_payment/{order_code}")
 def check_payment(order_code: str):
@@ -175,7 +168,6 @@ def check_payment(order_code: str):
     if status == "paid":
         return {"message": "Đã thanh toán"}
 
-    # 🔥 TẠM THỜI: giả lập khách đã chuyển khoản
     c.execute("UPDATE orders SET status='paid' WHERE order_code=?", (order_code,))
 
     license_key = "VEO-" + secrets.token_hex(6).upper()
