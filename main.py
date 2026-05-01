@@ -461,6 +461,8 @@ def order_page(order_code: str):
         license_html = """
         <p>Đơn hàng đang chờ thanh toán/xác nhận.</p>
         <p>Bước tiếp theo sẽ nối thanh toán tự động để key tự hiện sau khi chuyển khoản.</p>
+        <p><b>Test nhanh:</b> bấm link dưới để giả lập đã thanh toán và tự cấp key.</p>
+        <div class="code"><a style="color:#22c55e;" href="/admin/pay/{order_code}" target="_blank">Giả lập thanh toán: /admin/pay/{order_code}</a></div>
         """
 
     html = f"""
@@ -565,6 +567,77 @@ def confirm_order(data: ConfirmOrderRequest, x_admin_token: str = Header(default
         "license_key": license_data["license_key"],
         "credit": license_data["credit"],
         "expires_at": license_data["expires_at"]
+    }
+
+
+
+
+@app.get("/admin/pay/{order_code}")
+def fake_pay(order_code: str):
+    """
+    TEST ONLY:
+    Giả lập thanh toán thành công.
+    Khi gọi link này, server sẽ:
+    1. Tìm đơn hàng theo order_code
+    2. Đổi trạng thái đơn sang paid
+    3. Tự tạo license
+    4. Gắn license vào đơn hàng
+    """
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM orders WHERE order_code = ?", (order_code,))
+    order = cur.fetchone()
+
+    if not order:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Không tìm thấy đơn hàng")
+
+    if order["status"] == "paid" and order["license_key"]:
+        license_key = order["license_key"]
+        conn.close()
+        return {
+            "success": True,
+            "message": "Đơn hàng đã được thanh toán trước đó",
+            "order_code": order_code,
+            "email": order["email"],
+            "plan": order["plan"],
+            "license_key": license_key,
+            "order_url": f"/order/{order_code}"
+        }
+
+    conn.close()
+
+    license_data = create_license_for_order(order["email"], order["plan"])
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+    UPDATE orders
+    SET status = ?, license_key = ?, paid_at = ?
+    WHERE order_code = ?
+    """, (
+        "paid",
+        license_data["license_key"],
+        now_text(),
+        order_code
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "message": "Payment success - Đã giả lập thanh toán thành công",
+        "order_code": order_code,
+        "email": order["email"],
+        "plan": order["plan"],
+        "plan_name": license_data["plan_name"],
+        "license_key": license_data["license_key"],
+        "credit": license_data["credit"],
+        "expires_at": license_data["expires_at"],
+        "order_url": f"/order/{order_code}"
     }
 
 
