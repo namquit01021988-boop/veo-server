@@ -1,1583 +1,1379 @@
+"""
+VEO TOOL SAAS - PHASE 2 PRODUCTION BACKEND
+Stack:
+- FastAPI
+- PostgreSQL / Render
+- PayOS QR
+- License + Credit + Device HWID
+- Admin dashboard
+- Rate limit
+- Email Resend / SendGrid
+- Tool client auth session
+
+RUN LOCAL:
+    pip install -r requirements.txt
+    python main.py
+
+ENV REQUIRED:
+    DATABASE_URL=postgresql://...
+    APP_BASE_URL=https://your-domain.onrender.com
+    ADMIN_TOKEN=your_admin_token
+
+    PAYOS_CLIENT_ID=...
+    PAYOS_API_KEY=...
+    PAYOS_CHECKSUM_KEY=...
+
+OPTIONAL:
+    RESEND_API_KEY=...
+    SENDGRID_API_KEY=...
+    EMAIL_FROM=Veo Tool <noreply@yourdomain.com>
+    SECRET_KEY=change_this_long_random_secret
+"""
+
+from __future__ import annotations
+
 import os
+import hmac
+import json
 import time
-import secrets
+import uuid
+import base64
 import hashlib
-import smtplib
-from email.mime.text import MIMEText
-from datetime import datetime, timedelta
-from typing import Optional
+import secrets
+import datetime as dt
+from decimal import Decimal
+from typing import Optional, Dict, Any, List
 
-import sqlite3
+import requests
+from fastapi import FastAPI, Request, HTTPException, Depends, Header, Query, Form
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
 
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel
-
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-except Exception:
-    psycopg2 = None
-    RealDictCursor = None
-
-try:
-    from payos import PayOS
-    from payos.types import CreatePaymentLinkRequest
-except Exception:
-    PayOS = None
-    CreatePaymentLinkRequest = None
+from sqlalchemy import (
+    create_engine, Column, Integer, String, DateTime, Boolean, Text,
+    Numeric, ForeignKey, UniqueConstraint, Index, func
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-DB_NAME = "veo_server.db"
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./veo_tool_phase2.db")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "CHANGE_ME_ADMIN_TOKEN")
+SECRET_KEY = os.getenv("SECRET_KEY", "CHANGE_ME_SECRET_KEY_LONG_RANDOM")
 
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "CHANGE_ME_ADMIN_TOKEN")
-BASE_URL = os.environ.get("BASE_URL", "https://veo-server-65zd.onrender.com").rstrip("/")
+PAYOS_CLIENT_ID = os.getenv("PAYOS_CLIENT_ID", "")
+PAYOS_API_KEY = os.getenv("PAYOS_API_KEY", "")
+PAYOS_CHECKSUM_KEY = os.getenv("PAYOS_CHECKSUM_KEY", "")
 
-PAYOS_CLIENT_ID = os.environ.get("PAYOS_CLIENT_ID", "")
-PAYOS_API_KEY = os.environ.get("PAYOS_API_KEY", "")
-PAYOS_CHECKSUM_KEY = os.environ.get("PAYOS_CHECKSUM_KEY", "")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "Veo Tool <noreply@example.com>")
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "no-reply@veotool.local")
-SMTP_TLS = os.environ.get("SMTP_TLS", "true").lower() != "false"
+# Production-safe defaults
+MAX_DEVICES_DEFAULT = int(os.getenv("MAX_DEVICES_DEFAULT", "1"))
+LOGIN_RATE_LIMIT = int(os.getenv("LOGIN_RATE_LIMIT", "8"))          # per 10 min / IP
+CONSUME_RATE_LIMIT = int(os.getenv("CONSUME_RATE_LIMIT", "60"))     # per 10 min / license
+WEBHOOK_TIME_WINDOW_SECONDS = int(os.getenv("WEBHOOK_TIME_WINDOW_SECONDS", "900"))
+SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
 
-app = FastAPI(title="Veo Tool API Server")
-
-
-PLAN_CONFIG = {
-    "free": {
-        "name": "Free",
-        "credit": 5,
-        "days": 7,
-        "price": 0,
-        "price_text": "0 VNĐ",
-        "concurrent": 1,
-        "prompt_limit": 20,
-        "device_limit": 1,
-        "description": "Dùng thử 5 credit"
-    },
-    "starter": {
-        "name": "Starter",
-        "credit": 50,
-        "days": 30,
-        "price": 49000,
-        "price_text": "49,000 VNĐ",
-        "concurrent": 1,
-        "prompt_limit": 50,
-        "device_limit": 1,
-        "description": "Phù hợp người mới bắt đầu"
-    },
+PLANS = {
     "basic": {
         "name": "Basic",
-        "credit": 200,
+        "price": 199000,
+        "credits": 120,
         "days": 30,
-        "price": 149000,
-        "price_text": "149,000 VNĐ",
-        "concurrent": 3,
-        "prompt_limit": 150,
-        "device_limit": 2,
-        "description": "Gói phổ biến nhất"
+        "max_devices": 1,
     },
     "pro": {
         "name": "Pro",
-        "credit": 800,
-        "days": 30,
         "price": 399000,
-        "price_text": "399,000 VNĐ",
-        "concurrent": 9,
-        "prompt_limit": 300,
-        "device_limit": 3,
-        "description": "Dành cho người làm số lượng lớn"
-    }
+        "credits": 300,
+        "days": 30,
+        "max_devices": 1,
+    },
+    "premium": {
+        "name": "Premium",
+        "price": 799000,
+        "credits": 700,
+        "days": 30,
+        "max_devices": 2,
+    },
+    "month_pro": {
+        "name": "Monthly Pro",
+        "price": 499000,
+        "credits": 500,
+        "days": 30,
+        "max_devices": 2,
+        "subscription": True,
+    },
 }
 
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args=connect_args,
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
 
 # =========================================================
-# DB LAYER: PostgreSQL nếu có DATABASE_URL, fallback SQLite local
+# DATABASE MODELS
 # =========================================================
 
-def using_postgres() -> bool:
-    return bool(DATABASE_URL)
+class Order(Base):
+    __tablename__ = "orders"
+
+    id = Column(Integer, primary_key=True)
+    order_code = Column(String(64), unique=True, index=True, nullable=False)
+    email = Column(String(255), index=True, nullable=False)
+    plan = Column(String(64), nullable=False)
+    amount = Column(Numeric(12, 0), nullable=False)
+    status = Column(String(32), default="pending", index=True)  # pending/paid/cancelled/expired
+    payos_payment_link_id = Column(String(255), nullable=True)
+    payos_checkout_url = Column(Text, nullable=True)
+    payos_qr_code = Column(Text, nullable=True)
+    raw_payload = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    paid_at = Column(DateTime, nullable=True)
+
+    license = relationship("License", back_populates="order", uselist=False)
 
 
-def get_conn():
-    if using_postgres():
-        if psycopg2 is None:
-            raise RuntimeError("Thiếu psycopg2-binary. Hãy thêm psycopg2-binary vào requirements.txt")
-        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+class License(Base):
+    __tablename__ = "licenses"
 
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), index=True, nullable=False)
+    license_key_hash = Column(String(128), unique=True, index=True, nullable=False)
+    license_key_hint = Column(String(32), nullable=False)
+    plan = Column(String(64), nullable=False)
+    credits = Column(Integer, default=0)
+    total_credits = Column(Integer, default=0)
+    max_devices = Column(Integer, default=1)
+    expires_at = Column(DateTime, index=True, nullable=False)
+    blocked = Column(Boolean, default=False, index=True)
+    block_reason = Column(Text, nullable=True)
+    subscription_status = Column(String(32), default="none")  # none/active/past_due/cancelled
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
 
-
-def adapt_sql(sql: str) -> str:
-    if using_postgres():
-        return sql.replace("?", "%s")
-    return sql
-
-
-def row_to_dict(row):
-    if not row:
-        return None
-    return dict(row)
-
-
-def rows_to_dict(rows):
-    return [dict(r) for r in rows]
+    order = relationship("Order", back_populates="license")
+    devices = relationship("LicenseDevice", back_populates="license")
+    sessions = relationship("ClientSession", back_populates="license")
 
 
-def db_execute(sql: str, params=(), fetchone=False, fetchall=False):
-    conn = get_conn()
-    cur = conn.cursor()
+class LicenseDevice(Base):
+    __tablename__ = "license_devices"
+
+    id = Column(Integer, primary_key=True)
+    license_id = Column(Integer, ForeignKey("licenses.id"), index=True, nullable=False)
+    hwid_hash = Column(String(128), index=True, nullable=False)
+    device_name = Column(String(255), nullable=True)
+    first_ip = Column(String(64), nullable=True)
+    last_ip = Column(String(64), nullable=True)
+    first_seen = Column(DateTime, default=dt.datetime.utcnow)
+    last_seen = Column(DateTime, default=dt.datetime.utcnow)
+    trusted = Column(Boolean, default=True)
+    revoked = Column(Boolean, default=False)
+
+    license = relationship("License", back_populates="devices")
+    __table_args__ = (
+        UniqueConstraint("license_id", "hwid_hash", name="uq_license_hwid"),
+    )
+
+
+class AuthLog(Base):
+    __tablename__ = "auth_logs"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), index=True, nullable=True)
+    license_id = Column(Integer, nullable=True, index=True)
+    hwid_hash = Column(String(128), nullable=True)
+    ip = Column(String(64), nullable=True, index=True)
+    user_agent = Column(Text, nullable=True)
+    status = Column(String(32), index=True)  # success/fail/blocked/rate_limited
+    reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+
+class CreditLog(Base):
+    __tablename__ = "credit_logs"
+
+    id = Column(Integer, primary_key=True)
+    license_id = Column(Integer, index=True, nullable=False)
+    action = Column(String(32), index=True)  # consume/refund/add
+    amount = Column(Integer, nullable=False)
+    before_credit = Column(Integer, nullable=False)
+    after_credit = Column(Integer, nullable=False)
+    reason = Column(Text, nullable=True)
+    request_id = Column(String(128), nullable=True, index=True)
+    ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+
+class RateLimitLog(Base):
+    __tablename__ = "rate_limit_logs"
+
+    id = Column(Integer, primary_key=True)
+    bucket = Column(String(255), index=True, nullable=False)
+    ip = Column(String(64), index=True, nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+
+class WebhookLog(Base):
+    __tablename__ = "webhook_logs"
+
+    id = Column(Integer, primary_key=True)
+    provider = Column(String(64), default="payos")
+    event_id = Column(String(255), nullable=True, index=True)
+    order_code = Column(String(64), nullable=True, index=True)
+    valid_signature = Column(Boolean, default=False)
+    processed = Column(Boolean, default=False)
+    status = Column(String(32), default="received")
+    payload = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+
+class ClientSession(Base):
+    __tablename__ = "client_sessions"
+
+    id = Column(Integer, primary_key=True)
+    session_hash = Column(String(128), unique=True, index=True, nullable=False)
+    license_id = Column(Integer, ForeignKey("licenses.id"), index=True, nullable=False)
+    hwid_hash = Column(String(128), index=True, nullable=False)
+    ip = Column(String(64), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    expires_at = Column(DateTime, index=True, nullable=False)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    last_seen = Column(DateTime, default=dt.datetime.utcnow)
+
+    license = relationship("License", back_populates="sessions")
+
+
+Index("idx_credit_license_created", CreditLog.license_id, CreditLog.created_at)
+Index("idx_auth_ip_created", AuthLog.ip, AuthLog.created_at)
+
+
+# =========================================================
+# APP
+# =========================================================
+
+app = FastAPI(title="Veo Tool SaaS Phase 2", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================================================
+# UTILS
+# =========================================================
+
+def db_init() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
     try:
-        cur.execute(adapt_sql(sql), params)
-        result = None
-        if fetchone:
-            result = row_to_dict(cur.fetchone())
-        elif fetchall:
-            result = rows_to_dict(cur.fetchall())
-        conn.commit()
-        return result
+        yield db
     finally:
-        conn.close()
+        db.close()
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    if using_postgres():
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            id SERIAL PRIMARY KEY,
-            email TEXT NOT NULL,
-            license_key TEXT UNIQUE NOT NULL,
-            plan TEXT NOT NULL,
-            credit INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            order_code TEXT UNIQUE NOT NULL,
-            email TEXT NOT NULL,
-            plan TEXT NOT NULL,
-            amount INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            license_key TEXT,
-            created_at TEXT NOT NULL,
-            paid_at TEXT,
-            payment_url TEXT,
-            payos_data TEXT
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS license_devices (
-            id SERIAL PRIMARY KEY,
-            license_key TEXT NOT NULL,
-            device_id TEXT NOT NULL,
-            device_name TEXT,
-            ip TEXT,
-            user_agent TEXT,
-            status TEXT NOT NULL,
-            first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            UNIQUE(license_key, device_id)
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS auth_logs (
-            id SERIAL PRIMARY KEY,
-            email TEXT,
-            license_key TEXT,
-            device_id TEXT,
-            ip TEXT,
-            user_agent TEXT,
-            success INTEGER NOT NULL,
-            reason TEXT,
-            created_at TEXT NOT NULL
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS credit_logs (
-            id SERIAL PRIMARY KEY,
-            email TEXT,
-            license_key TEXT,
-            credit_before INTEGER,
-            credit_cost INTEGER,
-            credit_after INTEGER,
-            ip TEXT,
-            user_agent TEXT,
-            created_at TEXT NOT NULL
-        )
-        """)
-
-        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_url TEXT")
-        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payos_data TEXT")
-        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TEXT")
-        cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS license_key TEXT")
-
-    else:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT NOT NULL,
-            license_key TEXT UNIQUE NOT NULL,
-            plan TEXT NOT NULL,
-            credit INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_code TEXT UNIQUE NOT NULL,
-            email TEXT NOT NULL,
-            plan TEXT NOT NULL,
-            amount INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            license_key TEXT,
-            created_at TEXT NOT NULL,
-            paid_at TEXT,
-            payment_url TEXT,
-            payos_data TEXT
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS license_devices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT NOT NULL,
-            device_id TEXT NOT NULL,
-            device_name TEXT,
-            ip TEXT,
-            user_agent TEXT,
-            status TEXT NOT NULL,
-            first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            UNIQUE(license_key, device_id)
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS auth_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT,
-            license_key TEXT,
-            device_id TEXT,
-            ip TEXT,
-            user_agent TEXT,
-            success INTEGER NOT NULL,
-            reason TEXT,
-            created_at TEXT NOT NULL
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS credit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT,
-            license_key TEXT,
-            credit_before INTEGER,
-            credit_cost INTEGER,
-            credit_after INTEGER,
-            ip TEXT,
-            user_agent TEXT,
-            created_at TEXT NOT NULL
-        )
-        """)
-
-    conn.commit()
-    conn.close()
+def now_utc() -> dt.datetime:
+    return dt.datetime.utcnow()
 
 
-init_db()
-
-
-# =========================================================
-# MODELS
-# =========================================================
-
-class CreateLicenseRequest(BaseModel):
-    email: str
-    plan: str = "free"
-
-
-class LoginRequest(BaseModel):
-    email: str
-    license_key: str
-    device_id: Optional[str] = None
-    device_name: Optional[str] = None
-
-
-class ConsumeCreditRequest(BaseModel):
-    email: str
-    license_key: str
-    credit_cost: int
-    device_id: Optional[str] = None
-
-
-class AddCreditRequest(BaseModel):
-    email: str
-    license_key: str
-    credit: int
-
-
-class ChangePlanRequest(BaseModel):
-    email: str
-    license_key: str
-    plan: str
-
-
-class CreateOrderRequest(BaseModel):
-    email: str
-    plan: str
-
-
-class ConfirmOrderRequest(BaseModel):
-    order_code: str
-
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def now_text() -> str:
-    return datetime.now().isoformat()
-
-
-def make_license_key() -> str:
-    return "VEO-" + secrets.token_hex(8).upper()
-
-
-def make_order_code() -> str:
-    return str(int(time.time() * 1000))
-
-
-def format_money(amount: int) -> str:
-    return f"{amount:,} VNĐ"
-
-
-def get_client_ip(request: Optional[Request]) -> str:
-    if not request:
-        return ""
-    forwarded = request.headers.get("x-forwarded-for", "")
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return ""
+    return request.client.host if request.client else "unknown"
 
 
-def get_user_agent(request: Optional[Request]) -> str:
-    if not request:
-        return ""
-    return request.headers.get("user-agent", "")
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def make_device_id(data_device_id: Optional[str], request: Optional[Request]) -> str:
-    if data_device_id:
-        return data_device_id.strip()
-
-    header_device = request.headers.get("x-device-id", "").strip() if request else ""
-    if header_device:
-        return header_device
-
-    # Fallback để tool cũ vẫn chạy: fingerprint tạm từ IP + user-agent.
-    # Bản tool chuyên nghiệp nên gửi device_id cố định từ máy khách.
-    raw = f"{get_client_ip(request)}|{get_user_agent(request)}"
-    return "AUTO-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+def hash_license_key(key: str) -> str:
+    return sha256_text("license:" + key.strip())
 
 
-def get_payos_client():
-    if PayOS is None or CreatePaymentLinkRequest is None:
-        raise HTTPException(status_code=500, detail="Server chưa cài thư viện payos. Hãy thêm 'payos' vào requirements.txt và deploy lại.")
-
-    if not PAYOS_CLIENT_ID or not PAYOS_API_KEY or not PAYOS_CHECKSUM_KEY:
-        raise HTTPException(status_code=500, detail="Thiếu PAYOS_CLIENT_ID / PAYOS_API_KEY / PAYOS_CHECKSUM_KEY trong Environment Variables.")
-
-    return PayOS(client_id=PAYOS_CLIENT_ID, api_key=PAYOS_API_KEY, checksum_key=PAYOS_CHECKSUM_KEY)
+def hash_hwid(hwid: str) -> str:
+    cleaned = (hwid or "").strip().lower()
+    return sha256_text("hwid:" + cleaned)
 
 
-def log_auth(email: str, license_key: str, device_id: str, request: Optional[Request], success: bool, reason: str):
-    try:
-        db_execute("""
-        INSERT INTO auth_logs (email, license_key, device_id, ip, user_agent, success, reason, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            email,
-            license_key,
-            device_id,
-            get_client_ip(request),
-            get_user_agent(request),
-            1 if success else 0,
-            reason,
-            now_text()
-        ))
-    except Exception as e:
-        print("log_auth error:", e)
+def hash_session(token: str) -> str:
+    return sha256_text("session:" + token)
 
 
-def log_credit(email: str, license_key: str, before: int, cost: int, after: int, request: Optional[Request]):
-    try:
-        db_execute("""
-        INSERT INTO credit_logs (email, license_key, credit_before, credit_cost, credit_after, ip, user_agent, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            email,
-            license_key,
-            before,
-            cost,
-            after,
-            get_client_ip(request),
-            get_user_agent(request),
-            now_text()
-        ))
-    except Exception as e:
-        print("log_credit error:", e)
+def generate_license_key(plan: str) -> str:
+    prefix = "VEO"
+    body = secrets.token_urlsafe(24).replace("-", "").replace("_", "")[:28].upper()
+    return f"{prefix}-{plan.upper()}-{body[:7]}-{body[7:14]}-{body[14:21]}-{body[21:28]}"
 
 
-def bind_or_check_device(row: dict, data: LoginRequest, request: Optional[Request]):
-    plan_info = PLAN_CONFIG.get(row["plan"], {})
-    device_limit = int(plan_info.get("device_limit", 1))
-    device_id = make_device_id(data.device_id, request)
-    device_name = data.device_name or "Unknown device"
-
-    existing = db_execute("""
-    SELECT * FROM license_devices
-    WHERE license_key = ? AND device_id = ?
-    """, (row["license_key"], device_id), fetchone=True)
-
-    if existing:
-        if existing["status"] != "active":
-            raise HTTPException(status_code=403, detail="Thiết bị này đã bị khóa")
-
-        db_execute("""
-        UPDATE license_devices
-        SET last_seen = ?, ip = ?, user_agent = ?
-        WHERE license_key = ? AND device_id = ?
-        """, (
-            now_text(),
-            get_client_ip(request),
-            get_user_agent(request),
-            row["license_key"],
-            device_id
-        ))
-        return device_id
-
-    count_row = db_execute("""
-    SELECT COUNT(*) AS total
-    FROM license_devices
-    WHERE license_key = ? AND status = 'active'
-    """, (row["license_key"],), fetchone=True)
-
-    total_devices = int(count_row["total"] or 0)
-
-    if total_devices >= device_limit:
-        raise HTTPException(status_code=403, detail=f"License đã đạt giới hạn {device_limit} thiết bị")
-
-    db_execute("""
-    INSERT INTO license_devices (
-        license_key, device_id, device_name, ip, user_agent, status, first_seen, last_seen
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        row["license_key"],
-        device_id,
-        device_name,
-        get_client_ip(request),
-        get_user_agent(request),
-        "active",
-        now_text(),
-        now_text()
-    ))
-
-    return device_id
+def generate_order_code() -> str:
+    # PayOS orderCode usually numeric. Keep unique and short enough.
+    return str(int(time.time() * 1000))[-10:] + str(secrets.randbelow(9000) + 1000)
 
 
-def send_license_email(email: str, license_key: str, plan_name: str, credit: int, expires_at: str):
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
-        print("SMTP chưa cấu hình, bỏ qua gửi email.")
-        return False
+def constant_time_equal(a: str, b: str) -> bool:
+    return hmac.compare_digest(a or "", b or "")
 
-    subject = "License key Veo Tool của bạn"
-    body = f"""Xin chào,
 
-Cảm ơn bạn đã mua Veo Tool.
+def money_int(value: Any) -> int:
+    return int(Decimal(str(value)))
 
-Thông tin đăng nhập:
-Email: {email}
-License key: {license_key}
-Gói: {plan_name}
-Credit: {credit}
-Hạn dùng: {expires_at}
 
-Bạn mở tool Windows và nhập email + license key trên để đăng nhập.
-
-Trân trọng,
-Veo Tool
-"""
-
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = SMTP_FROM
-    msg["To"] = email
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        if SMTP_TLS:
-            server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-
+def require_admin(x_admin_token: Optional[str] = Header(None)):
+    if not ADMIN_TOKEN or ADMIN_TOKEN == "CHANGE_ME_ADMIN_TOKEN":
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is not configured")
+    if not x_admin_token or not constant_time_equal(x_admin_token, ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid admin token")
     return True
 
 
-def create_license_for_order(email: str, plan_key: str):
-    if plan_key not in PLAN_CONFIG:
-        raise HTTPException(status_code=400, detail="Gói cước không hợp lệ")
+def rate_limit_or_429(
+    db: Session,
+    bucket: str,
+    ip: Optional[str],
+    limit: int,
+    window_seconds: int = 600,
+):
+    cutoff = now_utc() - dt.timedelta(seconds=window_seconds)
+    count = db.query(RateLimitLog).filter(
+        RateLimitLog.bucket == bucket,
+        RateLimitLog.created_at >= cutoff
+    ).count()
 
-    plan = PLAN_CONFIG[plan_key]
-    license_key = make_license_key()
-    now = datetime.now()
-    expires_at = now + timedelta(days=plan["days"])
+    if count >= limit:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
 
-    db_execute("""
-    INSERT INTO licenses (
-        email, license_key, plan, credit, status, created_at, expires_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        email,
-        license_key,
-        plan_key,
-        plan["credit"],
-        "active",
-        now.isoformat(),
-        expires_at.isoformat()
-    ))
+    db.add(RateLimitLog(bucket=bucket, ip=ip))
+    db.commit()
 
+
+def sign_payload_for_client(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    sig = hmac.new(SECRET_KEY.encode(), raw, hashlib.sha256).hexdigest()
+    token = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return token + "." + sig
+
+
+def verify_client_token(token: str) -> Dict[str, Any]:
     try:
-        send_license_email(
-            email=email,
-            license_key=license_key,
-            plan_name=plan["name"],
-            credit=plan["credit"],
-            expires_at=expires_at.isoformat()
-        )
-    except Exception as e:
-        print("Send email error:", e)
+        data_part, sig = token.split(".", 1)
+        padding = "=" * (-len(data_part) % 4)
+        raw = base64.urlsafe_b64decode(data_part + padding)
+        expected = hmac.new(SECRET_KEY.encode(), raw, hashlib.sha256).hexdigest()
+        if not constant_time_equal(sig, expected):
+            raise ValueError("bad signature")
+        return json.loads(raw.decode())
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session token")
 
-    return {
-        "email": email,
-        "license_key": license_key,
-        "plan": plan_key,
-        "plan_name": plan["name"],
-        "credit": plan["credit"],
-        "days": plan["days"],
-        "expires_at": expires_at.isoformat()
+
+def verify_session(
+    request: Request,
+    db: Session,
+    authorization: Optional[str],
+    hwid: Optional[str],
+) -> License:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer session token")
+
+    token = authorization.split(" ", 1)[1].strip()
+    payload = verify_client_token(token)
+    session_plain_id = payload.get("sid")
+    license_id = payload.get("license_id")
+    exp = payload.get("exp")
+    hwid_hash_from_token = payload.get("hwid_hash")
+
+    if not session_plain_id or not license_id or not exp:
+        raise HTTPException(status_code=401, detail="Invalid session payload")
+
+    if int(exp) < int(time.time()):
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    if hwid:
+        req_hwid_hash = hash_hwid(hwid)
+        if not constant_time_equal(req_hwid_hash, hwid_hash_from_token):
+            raise HTTPException(status_code=401, detail="Device mismatch")
+
+    session_hash = hash_session(session_plain_id)
+    sess = db.query(ClientSession).filter(ClientSession.session_hash == session_hash).first()
+    if not sess or sess.revoked:
+        raise HTTPException(status_code=401, detail="Session revoked or not found")
+
+    license_obj = db.query(License).filter(License.id == license_id).first()
+    if not license_obj:
+        raise HTTPException(status_code=401, detail="License not found")
+
+    if license_obj.blocked:
+        raise HTTPException(status_code=403, detail="License blocked")
+
+    if license_obj.expires_at < now_utc():
+        raise HTTPException(status_code=403, detail="License expired")
+
+    if not constant_time_equal(sess.hwid_hash, hwid_hash_from_token):
+        raise HTTPException(status_code=401, detail="Session device mismatch")
+
+    sess.last_seen = now_utc()
+    sess.ip = client_ip(request)
+    db.commit()
+    return license_obj
+
+
+# =========================================================
+# PAYOS
+# =========================================================
+
+def payos_signature_from_data(data: Dict[str, Any]) -> str:
+    """
+    PayOS checksum usually signs sorted data as key=value&key=value.
+    Keep this function isolated so you can adjust if PayOS changes payload shape.
+    """
+    if not PAYOS_CHECKSUM_KEY:
+        return ""
+
+    clean = {}
+    for k, v in data.items():
+        if k in ("signature", "desc"):
+            continue
+        if v is None:
+            continue
+        if isinstance(v, (dict, list)):
+            clean[k] = json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+        else:
+            clean[k] = str(v)
+
+    raw = "&".join(f"{k}={clean[k]}" for k in sorted(clean.keys()))
+    return hmac.new(PAYOS_CHECKSUM_KEY.encode(), raw.encode(), hashlib.sha256).hexdigest()
+
+
+def verify_payos_webhook(payload: Dict[str, Any]) -> bool:
+    """
+    Supports common PayOS format:
+    {
+      "code": "00",
+      "desc": "...",
+      "success": true,
+      "data": {...},
+      "signature": "..."
     }
+    """
+    signature = payload.get("signature", "")
+    data = payload.get("data", payload)
+
+    if not isinstance(data, dict):
+        return False
+
+    expected = payos_signature_from_data(data)
+    return bool(signature and expected and constant_time_equal(signature, expected))
 
 
-def mark_order_paid_and_create_license(order_code: str):
-    order = db_execute("SELECT * FROM orders WHERE order_code = ?", (str(order_code),), fetchone=True)
-
-    if not order:
-        raise HTTPException(status_code=404, detail="Không tìm thấy đơn hàng")
-
-    if order["status"] == "paid" and order.get("license_key"):
+def create_payos_payment(order: Order) -> Dict[str, Any]:
+    """
+    Create PayOS payment link.
+    If PayOS env is missing, this returns a local checkout placeholder.
+    """
+    if not (PAYOS_CLIENT_ID and PAYOS_API_KEY and PAYOS_CHECKSUM_KEY):
+        checkout_url = f"{APP_BASE_URL}/order/{order.order_code}"
         return {
-            "success": True,
-            "message": "Đơn hàng đã thanh toán trước đó",
-            "order_code": order["order_code"],
-            "email": order["email"],
-            "plan": order["plan"],
-            "license_key": order["license_key"]
+            "checkoutUrl": checkout_url,
+            "qrCode": "",
+            "paymentLinkId": "LOCAL_DEV",
         }
 
-    license_data = create_license_for_order(order["email"], order["plan"])
+    payload = {
+        "orderCode": int(order.order_code),
+        "amount": money_int(order.amount),
+        "description": f"VEO {order.plan}",
+        "buyerName": order.email.split("@")[0],
+        "buyerEmail": order.email,
+        "returnUrl": f"{APP_BASE_URL}/payment/success?order_code={order.order_code}",
+        "cancelUrl": f"{APP_BASE_URL}/payment/cancel?order_code={order.order_code}",
+    }
+    payload["signature"] = payos_signature_from_data(payload)
 
-    db_execute("""
-    UPDATE orders
-    SET status = ?, license_key = ?, paid_at = ?
-    WHERE order_code = ?
-    """, (
-        "paid",
-        license_data["license_key"],
-        now_text(),
-        str(order_code)
-    ))
+    url = "https://api-merchant.payos.vn/v2/payment-requests"
+    headers = {
+        "x-client-id": PAYOS_CLIENT_ID,
+        "x-api-key": PAYOS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=20)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"PayOS error: {r.text}")
 
+    res = r.json()
+    data = res.get("data", {})
     return {
-        "success": True,
-        "message": "Đã thanh toán và cấp license",
-        "order_code": str(order_code),
-        "email": order["email"],
-        "plan": order["plan"],
-        "license_key": license_data["license_key"],
-        "credit": license_data["credit"],
-        "expires_at": license_data["expires_at"]
+        "checkoutUrl": data.get("checkoutUrl"),
+        "qrCode": data.get("qrCode"),
+        "paymentLinkId": data.get("paymentLinkId"),
+        "raw": res,
     }
 
 
-def check_payos_and_update_order(order_code: str):
-    order = db_execute("SELECT * FROM orders WHERE order_code = ?", (str(order_code),), fetchone=True)
+# =========================================================
+# EMAIL
+# =========================================================
+
+def send_email(to: str, subject: str, html: str, text: Optional[str] = None) -> bool:
+    if RESEND_API_KEY:
+        try:
+            r = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": EMAIL_FROM,
+                    "to": [to],
+                    "subject": subject,
+                    "html": html,
+                    "text": text or subject,
+                },
+                timeout=15,
+            )
+            return r.status_code < 400
+        except Exception:
+            return False
+
+    if SENDGRID_API_KEY:
+        try:
+            r = requests.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={
+                    "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "personalizations": [{"to": [{"email": to}]}],
+                    "from": {"email": EMAIL_FROM.split("<")[-1].replace(">", "").strip()},
+                    "subject": subject,
+                    "content": [{"type": "text/html", "value": html}],
+                },
+                timeout=15,
+            )
+            return r.status_code < 400
+        except Exception:
+            return False
+
+    print("EMAIL_DISABLED:", to, subject)
+    print(html)
+    return False
+
+
+def send_license_email(email: str, license_key: str, plan: str, credits: int, expires_at: dt.datetime):
+    html = f"""
+    <h2>Veo Tool License</h2>
+    <p>Cảm ơn bạn đã thanh toán thành công.</p>
+    <p><b>Email:</b> {email}</p>
+    <p><b>Plan:</b> {plan}</p>
+    <p><b>Credit:</b> {credits}</p>
+    <p><b>Hết hạn:</b> {expires_at.strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
+    <p><b>License key:</b></p>
+    <pre style="font-size:18px;padding:12px;background:#f2f2f2">{license_key}</pre>
+    <p>Không chia sẻ key này cho người khác. Mỗi license bị giới hạn số thiết bị.</p>
+    """
+    send_email(email, "Veo Tool - License key của bạn", html)
+
+
+# =========================================================
+# BUSINESS LOGIC
+# =========================================================
+
+def create_license_for_paid_order(db: Session, order: Order) -> License:
+    existing = db.query(License).filter(License.order_id == order.id).first()
+    if existing:
+        return existing
+
+    plan_conf = PLANS.get(order.plan)
+    if not plan_conf:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    plain_key = generate_license_key(order.plan)
+    key_hash = hash_license_key(plain_key)
+    expires_at = now_utc() + dt.timedelta(days=int(plan_conf["days"]))
+    subscription_status = "active" if plan_conf.get("subscription") else "none"
+
+    lic = License(
+        email=order.email,
+        license_key_hash=key_hash,
+        license_key_hint=plain_key[-8:],
+        plan=order.plan,
+        credits=int(plan_conf["credits"]),
+        total_credits=int(plan_conf["credits"]),
+        max_devices=int(plan_conf.get("max_devices", MAX_DEVICES_DEFAULT)),
+        expires_at=expires_at,
+        subscription_status=subscription_status,
+        order_id=order.id,
+    )
+    db.add(lic)
+    db.commit()
+    db.refresh(lic)
+
+    send_license_email(order.email, plain_key, order.plan, lic.credits, expires_at)
+
+    # Keep plain key only in order raw payload email copy for first response? Do not store plain key in production.
+    order.raw_payload = json.dumps({
+        "license_created": True,
+        "license_key_hint": lic.license_key_hint,
+        "email_sent": True,
+    }, ensure_ascii=False)
+    db.commit()
+    return lic
+
+
+def mark_order_paid(db: Session, order_code: str, payload: Optional[Dict[str, Any]] = None) -> Order:
+    order = db.query(Order).filter(Order.order_code == str(order_code)).first()
     if not order:
-        return None
+        raise HTTPException(status_code=404, detail="Order not found")
 
-    if order["status"] == "paid":
-        return order
+    if order.status != "paid":
+        order.status = "paid"
+        order.paid_at = now_utc()
+        if payload:
+            order.raw_payload = json.dumps(payload, ensure_ascii=False)
+        db.commit()
+        db.refresh(order)
 
-    try:
-        payos_client = get_payos_client()
-        payment_info = None
-
-        if hasattr(payos_client, "payment_requests"):
-            payment_info = payos_client.payment_requests.get(int(order_code))
-        elif hasattr(payos_client, "get_payment_link_information"):
-            payment_info = payos_client.get_payment_link_information(int(order_code))
-        elif hasattr(payos_client, "getPaymentLinkInformation"):
-            payment_info = payos_client.getPaymentLinkInformation(int(order_code))
-
-        payment_status = None
-
-        if payment_info:
-            payment_status = getattr(payment_info, "status", None) or getattr(payment_info, "paymentLinkStatus", None)
-
-            if isinstance(payment_info, dict):
-                payment_status = payment_info.get("status") or payment_info.get("paymentLinkStatus") or payment_status
-
-        if str(payment_status).upper() == "PAID":
-            mark_order_paid_and_create_license(str(order_code))
-            return db_execute("SELECT * FROM orders WHERE order_code = ?", (str(order_code),), fetchone=True)
-
-    except Exception as e:
-        print("PayOS status check error:", e)
-
+    create_license_for_paid_order(db, order)
     return order
 
 
-def plan_card(plan_key, plan):
-    return f"""
-<div class="card">
-    <div class="badge">{plan["description"]}</div>
-    <h2>{plan["name"]}</h2>
-    <div class="feature green">Thời gian sử dụng: {plan["days"]} ngày</div>
-    <div class="feature purple">{plan["credit"]} credit</div>
-    <div class="feature orange">Xử lý {plan["concurrent"]} video cùng lúc</div>
-    <div class="feature">Prompt tối đa/lần: {plan["prompt_limit"]}</div>
-    <div class="feature">Giới hạn thiết bị: {plan["device_limit"]}</div>
-    <div class="price">{plan["price_text"]}</div>
-    <input class="email" id="email-{plan_key}" placeholder="Nhập email nhận license">
-    <button onclick="createOrder('{plan_key}')">Chọn gói này</button>
-</div>
-"""
+# =========================================================
+# SCHEMAS
+# =========================================================
+
+class CreateOrderIn(BaseModel):
+    email: EmailStr
+    plan: str
 
 
-def admin_ok(token: str):
-    return token == ADMIN_TOKEN and token not in ["", "CHANGE_ME_ADMIN_TOKEN"]
+class LoginIn(BaseModel):
+    email: EmailStr
+    license_key: str
+    hwid: str = Field(..., min_length=8)
+    device_name: Optional[str] = "Windows PC"
+
+
+class UsageConsumeIn(BaseModel):
+    credits: int = Field(..., ge=1, le=100)
+    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    reason: Optional[str] = "video_generation"
+    hwid: Optional[str] = None
+
+
+class UsageCheckIn(BaseModel):
+    hwid: Optional[str] = None
+
+
+class AdminCreditIn(BaseModel):
+    license_id: int
+    amount: int
+    reason: Optional[str] = "admin_adjust"
+
+
+class AdminBlockIn(BaseModel):
+    license_id: int
+    blocked: bool
+    reason: Optional[str] = None
+
+
+class AdminDeviceRevokeIn(BaseModel):
+    device_id: int
+    revoked: bool = True
 
 
 # =========================================================
 # PUBLIC ROUTES
 # =========================================================
 
-@app.get("/")
+@app.on_event("startup")
+def on_startup():
+    db_init()
+
+
+@app.get("/", response_class=HTMLResponse)
 def home():
-    return {
-        "message": "Veo Tool API Server is running",
-        "version": "phase1-secure-postgres-device-logs",
-        "database": "postgresql" if using_postgres() else "sqlite-local"
-    }
+    return """
+    <h2>Veo Tool SaaS Backend Phase 2</h2>
+    <p>Status: OK</p>
+    <p><a href="/shop">Open Shop</a></p>
+    """
 
 
-@app.get("/plans")
-def plans():
-    return {"plans": PLAN_CONFIG}
+@app.get("/health")
+def health():
+    return {"ok": True, "version": "2.0.0", "time": now_utc().isoformat()}
 
 
 @app.get("/shop", response_class=HTMLResponse)
 def shop():
-    starter = PLAN_CONFIG["starter"]
-    basic = PLAN_CONFIG["basic"]
-    pro = PLAN_CONFIG["pro"]
-
-    html = f"""
-<!doctype html>
-<html lang="vi">
-<head>
-    <meta charset="utf-8">
-    <title>Veo Tool - Mua gói</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {{
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background: linear-gradient(135deg, #eef5ff, #f5f3ff);
-            color: #0f172a;
-        }}
-        .wrap {{
-            max-width: 1160px;
-            margin: 0 auto;
-            padding: 34px 16px;
-        }}
-        h1 {{
-            text-align: center;
-            font-size: 36px;
-            margin-bottom: 8px;
-        }}
-        .sub {{
-            text-align: center;
-            color: #475569;
-            margin-bottom: 32px;
-        }}
-        .plans {{
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 18px;
-        }}
-        .card {{
-            background: white;
-            border: 1px solid #dbeafe;
-            border-radius: 18px;
-            padding: 22px;
-            box-shadow: 0 12px 30px rgba(15,23,42,.08);
-        }}
-        .badge {{
-            text-align:center;
-            font-size:13px;
-            color:#0369a1;
-            background:#e0f2fe;
-            padding:8px;
-            border-radius:999px;
-            margin-bottom:12px;
-        }}
-        .card h2 {{
-            text-align: center;
-            margin: 0 0 12px;
-            font-size: 25px;
-        }}
-        .price {{
-            text-align: center;
-            font-size: 30px;
-            font-weight: bold;
-            margin: 18px 0;
-            color: #7c3aed;
-        }}
-        .feature {{
-            background: #f1f5f9;
-            margin: 8px 0;
-            padding: 10px;
-            border-radius: 12px;
-            text-align: center;
-        }}
-        .feature.green {{ background: #dcfce7; color: #065f46; }}
-        .feature.purple {{ background: #ede9fe; color: #4c1d95; }}
-        .feature.orange {{ background: #fef3c7; color: #92400e; }}
-        .email {{
-            width: 100%;
-            box-sizing: border-box;
-            padding: 12px;
-            border: 2px solid #c084fc;
-            border-radius: 12px;
-            margin-top: 14px;
-            font-size: 15px;
-        }}
-        button {{
-            width: 100%;
-            padding: 13px;
-            border: none;
-            border-radius: 12px;
-            background: #22c55e;
-            color: white;
-            font-weight: bold;
-            font-size: 16px;
-            margin-top: 12px;
-            cursor: pointer;
-        }}
-        button:hover {{ background: #16a34a; }}
-        @media (max-width: 850px) {{
-            .plans {{ grid-template-columns: 1fr; }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="wrap">
-        <h1>Veo Tool - Mua gói cước</h1>
-        <div class="sub">Thanh toán QR payOS. Server lưu PostgreSQL, tự cấp license, giới hạn thiết bị và ghi log bảo mật.</div>
-
-        <div class="plans">
-            {plan_card("starter", starter)}
-            {plan_card("basic", basic)}
-            {plan_card("pro", pro)}
+    cards = ""
+    for key, p in PLANS.items():
+        cards += f"""
+        <div style="border:1px solid #ddd;border-radius:14px;padding:20px;margin:12px;width:260px">
+            <h3>{p['name']}</h3>
+            <p><b>{p['price']:,} VND</b></p>
+            <p>{p['credits']} credits / {p['days']} ngày</p>
+            <p>{p.get('max_devices', 1)} thiết bị</p>
+            <form method="post" action="/shop/create">
+                <input name="email" placeholder="Email của bạn" required style="padding:10px;width:95%">
+                <input type="hidden" name="plan" value="{key}">
+                <button style="margin-top:12px;padding:10px 16px">Thanh toán</button>
+            </form>
         </div>
-    </div>
-
-<script>
-async function createOrder(plan) {{
-    const email = document.getElementById("email-" + plan).value.trim();
-    if (!email) {{
-        alert("Vui lòng nhập email");
-        return;
-    }}
-
-    const res = await fetch("/api/create-order", {{
-        method: "POST",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{ email, plan }})
-    }});
-
-    const data = await res.json();
-
-    if (!res.ok) {{
-        alert(data.detail || "Không tạo được đơn hàng");
-        return;
-    }}
-
-    window.location.href = "/order/" + data.order_code;
-}}
-</script>
-</body>
-</html>
-"""
-    return html
+        """
+    return f"""
+    <html><head><title>Veo Tool Shop</title></head>
+    <body style="font-family:Arial;max-width:1100px;margin:40px auto">
+        <h1>Veo Tool Shop</h1>
+        <div style="display:flex;flex-wrap:wrap">{cards}</div>
+    </body></html>
+    """
 
 
-@app.post("/api/create-order")
-def create_order(data: CreateOrderRequest):
-    if data.plan not in PLAN_CONFIG:
-        raise HTTPException(status_code=400, detail="Gói cước không hợp lệ")
+@app.post("/shop/create")
+def shop_create_form(
+    email: EmailStr = Form(...),
+    plan: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    data = CreateOrderIn(email=email, plan=plan)
+    res = create_order(data, db)
+    return RedirectResponse(res["checkout_url"], status_code=303)
 
-    if data.plan == "free":
-        raise HTTPException(status_code=400, detail="Không tạo đơn hàng cho gói free")
 
-    email = data.email.strip().lower()
-    if "@" not in email or "." not in email:
-        raise HTTPException(status_code=400, detail="Email không hợp lệ")
+@app.post("/orders/create")
+def create_order(data: CreateOrderIn, db: Session = Depends(get_db)):
+    if data.plan not in PLANS:
+        raise HTTPException(status_code=400, detail="Invalid plan")
 
-    plan = PLAN_CONFIG[data.plan]
-    order_code = make_order_code()
-
-    payos_client = get_payos_client()
-
-    description = f"VEO{order_code[-8:]}"
-    return_url = f"{BASE_URL}/order/{order_code}"
-    cancel_url = f"{BASE_URL}/order/{order_code}"
-
-    payment_request = CreatePaymentLinkRequest(
-        order_code=int(order_code),
-        amount=plan["price"],
-        description=description[:25],
-        items=[{"name": f"Veo Tool {plan['name']}", "quantity": 1, "price": plan["price"]}],
-        cancel_url=cancel_url,
-        return_url=return_url
+    plan_conf = PLANS[data.plan]
+    order = Order(
+        order_code=generate_order_code(),
+        email=str(data.email).lower(),
+        plan=data.plan,
+        amount=int(plan_conf["price"]),
+        status="pending",
     )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
 
-    try:
-        payment_link = payos_client.payment_requests.create(payment_request)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi tạo thanh toán payOS: {e}")
-
-    checkout_url = getattr(payment_link, "checkout_url", None) or getattr(payment_link, "checkoutUrl", None)
-    qr_code = getattr(payment_link, "qr_code", None) or getattr(payment_link, "qrCode", None)
-
-    if isinstance(payment_link, dict):
-        checkout_url = payment_link.get("checkoutUrl") or payment_link.get("checkout_url") or checkout_url
-        qr_code = payment_link.get("qrCode") or payment_link.get("qr_code") or qr_code
-
-    db_execute("""
-    INSERT INTO orders (
-        order_code, email, plan, amount, status, license_key, created_at, paid_at, payment_url, payos_data
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        order_code,
-        email,
-        data.plan,
-        plan["price"],
-        "pending",
-        None,
-        now_text(),
-        None,
-        checkout_url,
-        str(payment_link)
-    ))
+    pay = create_payos_payment(order)
+    order.payos_checkout_url = pay.get("checkoutUrl")
+    order.payos_qr_code = pay.get("qrCode")
+    order.payos_payment_link_id = pay.get("paymentLinkId")
+    order.raw_payload = json.dumps(pay.get("raw", pay), ensure_ascii=False)
+    db.commit()
 
     return {
-        "success": True,
-        "order_code": order_code,
-        "email": email,
-        "plan": data.plan,
-        "plan_name": plan["name"],
-        "amount": plan["price"],
-        "amount_text": plan["price_text"],
-        "status": "pending",
-        "payment_url": checkout_url,
-        "qr_code": qr_code
+        "order_code": order.order_code,
+        "email": order.email,
+        "plan": order.plan,
+        "amount": money_int(order.amount),
+        "checkout_url": order.payos_checkout_url,
+        "qr_code": order.payos_qr_code,
     }
 
 
 @app.get("/order/{order_code}", response_class=HTMLResponse)
-def order_page(order_code: str):
-    row = check_payos_and_update_order(str(order_code))
+def order_page(order_code: str, db: Session = Depends(get_db)):
+    order = db.query(Order).filter(Order.order_code == order_code).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
 
-    if not row:
-        return HTMLResponse("<h2>Không tìm thấy đơn hàng</h2>", status_code=404)
-
-    plan = PLAN_CONFIG.get(row["plan"], {})
-    status = row["status"]
-
-    if status == "paid" and row.get("license_key"):
-        payment_html = f"""
-        <div class="success">✅ Thanh toán thành công</div>
-        <h3>License key của bạn:</h3>
-        <div class="code">{row["license_key"]}</div>
-        <p>Dùng email <b>{row["email"]}</b> và license key trên để đăng nhập tool.</p>
-        <p>Hệ thống cũng đã gửi license về email nếu SMTP được cấu hình.</p>
-        """
-    else:
-        payment_url = row.get("payment_url") or ""
-        payment_html = f"""
-        <div class="pending">⏳ Đơn hàng đang chờ thanh toán</div>
-        <p>Quét QR trong khung bên dưới hoặc bấm mở trang thanh toán payOS.</p>
-
-        <div class="paybox">
-            <iframe src="{payment_url}" class="payframe"></iframe>
-        </div>
-
-        <p>
-            <a class="btn" href="{payment_url}" target="_blank">Mở trang thanh toán payOS</a>
-            <a class="btn gray" href="/order/{order_code}">Tôi đã thanh toán - kiểm tra lại</a>
-        </p>
-
-        <p class="note">Sau khi thanh toán xong, bấm “Tôi đã thanh toán - kiểm tra lại”. Server sẽ tự hỏi payOS và tự cấp license.</p>
-        """
-
-    html = f"""
-<!doctype html>
-<html lang="vi">
-<head>
-    <meta charset="utf-8">
-    <title>Đơn hàng {order_code}</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            background:#eef5ff;
-            padding:24px;
-            color:#0f172a;
-        }}
-        .box {{
-            max-width:900px;
-            margin:0 auto;
-            background:white;
-            border-radius:18px;
-            padding:26px;
-            box-shadow:0 12px 30px rgba(15,23,42,.08);
-        }}
-        .code {{
-            font-family:monospace;
-            background:#0f172a;
-            color:#22c55e;
-            padding:12px;
-            border-radius:8px;
-            overflow-wrap:anywhere;
-        }}
-        .status {{
-            display:inline-block;
-            padding:8px 12px;
-            border-radius:999px;
-            background:#ede9fe;
-            color:#4c1d95;
-            font-weight:bold;
-        }}
-        .success {{
-            background:#dcfce7;
-            color:#166534;
-            padding:12px;
-            border-radius:12px;
-            font-weight:bold;
-            margin-top:16px;
-        }}
-        .pending {{
-            background:#fef3c7;
-            color:#92400e;
-            padding:12px;
-            border-radius:12px;
-            font-weight:bold;
-            margin-top:16px;
-        }}
-        .paybox {{
-            margin-top:16px;
-            border:1px solid #dbeafe;
-            border-radius:16px;
-            overflow:hidden;
-            background:#f8fafc;
-        }}
-        .payframe {{
-            width:100%;
-            height:720px;
-            border:0;
-        }}
-        .btn {{
-            display:inline-block;
-            margin-top:14px;
-            margin-right:8px;
-            padding:12px 16px;
-            background:#22c55e;
-            color:white;
-            border-radius:12px;
-            text-decoration:none;
-            font-weight:bold;
-        }}
-        .btn.gray {{
-            background:#64748b;
-        }}
-        .note {{
-            color:#475569;
-            font-size:14px;
-        }}
-    </style>
-</head>
-<body>
-    <div class="box">
-        <h1>Thông tin đơn hàng</h1>
-        <p><b>Mã đơn:</b></p>
-        <div class="code">{row["order_code"]}</div>
-        <p><b>Email:</b> {row["email"]}</p>
-        <p><b>Gói:</b> {plan.get("name", row["plan"])}</p>
-        <p><b>Số tiền:</b> {format_money(row["amount"])}</p>
-        <p><b>Trạng thái:</b> <span class="status">{status}</span></p>
-        {payment_html}
-    </div>
-</body>
-</html>
-"""
-    return html
+    qr = ""
+    if order.payos_qr_code:
+        qr = f'<img src="{order.payos_qr_code}" style="max-width:300px">'
+    return f"""
+    <html><body style="font-family:Arial;max-width:720px;margin:40px auto">
+        <h2>Đơn hàng #{order.order_code}</h2>
+        <p>Email: <b>{order.email}</b></p>
+        <p>Gói: <b>{order.plan}</b></p>
+        <p>Số tiền: <b>{money_int(order.amount):,} VND</b></p>
+        <p>Trạng thái: <b>{order.status}</b></p>
+        <p><a href="{order.payos_checkout_url or '#'}">Mở trang thanh toán PayOS</a></p>
+        {qr}
+    </body></html>
+    """
 
 
-@app.post("/webhook/payos")
-async def payos_webhook(request: Request):
-    payos_client = get_payos_client()
+@app.get("/payment/success", response_class=HTMLResponse)
+def payment_success(order_code: str):
+    return f"""
+    <h2>Thanh toán thành công</h2>
+    <p>Đơn hàng: {order_code}</p>
+    <p>Nếu thanh toán đã xác nhận, license sẽ được gửi về email.</p>
+    """
 
-    try:
-        body = await request.body()
-        verified = payos_client.webhooks.verify(body)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Webhook không hợp lệ: {e}")
 
-    order_code = getattr(verified, "order_code", None) or getattr(verified, "orderCode", None)
+@app.get("/payment/cancel", response_class=HTMLResponse)
+def payment_cancel(order_code: str):
+    return f"<h2>Thanh toán bị hủy</h2><p>Đơn hàng: {order_code}</p>"
 
-    if isinstance(verified, dict):
-        order_code = verified.get("orderCode") or verified.get("order_code") or order_code
+
+@app.post("/payos/webhook")
+async def payos_webhook(request: Request, db: Session = Depends(get_db)):
+    payload = await request.json()
+    valid = verify_payos_webhook(payload)
+
+    data = payload.get("data", payload)
+    order_code = str(data.get("orderCode") or data.get("order_code") or "")
+    event_id = str(data.get("paymentLinkId") or data.get("reference") or order_code or uuid.uuid4())
+
+    log = WebhookLog(
+        provider="payos",
+        event_id=event_id,
+        order_code=order_code,
+        valid_signature=valid,
+        payload=json.dumps(payload, ensure_ascii=False),
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+
+    if not valid:
+        log.status = "invalid_signature"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Invalid PayOS signature")
+
+    success = payload.get("success")
+    code = payload.get("code")
+    desc = str(payload.get("desc", "")).lower()
+    amount = data.get("amount")
+    status_ok = success is True or code == "00" or "success" in desc or "paid" in desc
 
     if not order_code:
-        raise HTTPException(status_code=400, detail="Webhook thiếu orderCode")
+        log.status = "missing_order_code"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Missing orderCode")
 
-    result = mark_order_paid_and_create_license(str(order_code))
+    order = db.query(Order).filter(Order.order_code == order_code).first()
+    if not order:
+        log.status = "order_not_found"
+        db.commit()
+        raise HTTPException(status_code=404, detail="Order not found")
 
-    return {
-        "success": True,
-        "message": "OK",
-        "order_code": str(order_code),
-        "license_key": result.get("license_key")
-    }
+    if amount is not None and money_int(amount) != money_int(order.amount):
+        log.status = "amount_mismatch"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Amount mismatch")
+
+    if status_ok:
+        mark_order_paid(db, order_code, payload)
+        log.processed = True
+        log.status = "processed_paid"
+        db.commit()
+        return {"ok": True, "message": "paid processed"}
+
+    log.status = "ignored_not_paid"
+    db.commit()
+    return {"ok": True, "message": "ignored"}
+
+
+# Backward compatibility route, disabled by default.
+@app.get("/admin/pay")
+def fake_pay_disabled():
+    raise HTTPException(status_code=403, detail="Fake payment route disabled in production")
 
 
 # =========================================================
-# ADMIN DASHBOARD + ADMIN API
+# TOOL CLIENT ROUTES
 # =========================================================
 
-@app.get("/admin", response_class=HTMLResponse)
-def admin_dashboard(token: str = ""):
-    if not admin_ok(token):
-        return HTMLResponse("""
-        <h2>Veo Admin Login</h2>
-        <p>Nhập ADMIN_TOKEN đã đặt trong Render Environment.</p>
-        <form>
-            <input name="token" placeholder="Admin token" style="padding:10px;width:360px">
-            <button style="padding:10px">Đăng nhập</button>
-        </form>
-        """, status_code=401)
-
-    orders = db_execute("SELECT * FROM orders ORDER BY id DESC LIMIT 100", fetchall=True)
-    licenses = db_execute("SELECT * FROM licenses ORDER BY id DESC LIMIT 100", fetchall=True)
-    devices = db_execute("SELECT * FROM license_devices ORDER BY id DESC LIMIT 100", fetchall=True)
-    auth_logs = db_execute("SELECT * FROM auth_logs ORDER BY id DESC LIMIT 100", fetchall=True)
-    credit_logs = db_execute("SELECT * FROM credit_logs ORDER BY id DESC LIMIT 100", fetchall=True)
-
-    total_revenue = sum(o["amount"] for o in orders if o["status"] == "paid")
-    paid_count = sum(1 for o in orders if o["status"] == "paid")
-    pending_count = sum(1 for o in orders if o["status"] != "paid")
-
-    order_rows = ""
-    for o in orders:
-        plan_name = PLAN_CONFIG.get(o["plan"], {}).get("name", o["plan"])
-        license_value = o.get("license_key") or "-"
-        confirm_link = f"/admin/confirm-order-ui?token={token}&order_code={o['order_code']}"
-        order_rows += f"""
-        <tr>
-            <td>{o['order_code']}</td>
-            <td>{o['email']}</td>
-            <td>{plan_name}</td>
-            <td>{format_money(o['amount'])}</td>
-            <td><b>{o['status']}</b></td>
-            <td class="mono">{license_value}</td>
-            <td><a href="/order/{o['order_code']}" target="_blank">Xem</a> | <a href="{confirm_link}">Duyệt</a></td>
-        </tr>
-        """
-
-    license_rows = ""
-    for l in licenses:
-        plan_name = PLAN_CONFIG.get(l["plan"], {}).get("name", l["plan"])
-        lock_link = f"/admin/set-license-status?token={token}&email={l['email']}&license_key={l['license_key']}&status=locked"
-        unlock_link = f"/admin/set-license-status?token={token}&email={l['email']}&license_key={l['license_key']}&status=active"
-        license_rows += f"""
-        <tr>
-            <td>{l['email']}</td>
-            <td class="mono">{l['license_key']}</td>
-            <td>{plan_name}</td>
-            <td>{l['credit']}</td>
-            <td>{l['status']}</td>
-            <td>{l['expires_at']}</td>
-            <td><a href="{lock_link}">Khóa</a> | <a href="{unlock_link}">Mở</a></td>
-        </tr>
-        """
-
-    device_rows = ""
-    for d in devices:
-        lock_device = f"/admin/set-device-status?token={token}&license_key={d['license_key']}&device_id={d['device_id']}&status=locked"
-        unlock_device = f"/admin/set-device-status?token={token}&license_key={d['license_key']}&device_id={d['device_id']}&status=active"
-        device_rows += f"""
-        <tr>
-            <td class="mono">{d['license_key']}</td>
-            <td class="mono">{d['device_id']}</td>
-            <td>{d.get('device_name') or '-'}</td>
-            <td>{d['status']}</td>
-            <td>{d.get('ip') or '-'}</td>
-            <td>{d['last_seen']}</td>
-            <td><a href="{lock_device}">Khóa</a> | <a href="{unlock_device}">Mở</a></td>
-        </tr>
-        """
-
-    auth_rows = ""
-    for a in auth_logs:
-        auth_rows += f"""
-        <tr>
-            <td>{a['created_at']}</td>
-            <td>{a.get('email') or '-'}</td>
-            <td class="mono">{a.get('device_id') or '-'}</td>
-            <td>{'OK' if a['success'] else 'FAIL'}</td>
-            <td>{a.get('reason') or '-'}</td>
-            <td>{a.get('ip') or '-'}</td>
-        </tr>
-        """
-
-    credit_rows = ""
-    for c in credit_logs:
-        credit_rows += f"""
-        <tr>
-            <td>{c['created_at']}</td>
-            <td>{c.get('email') or '-'}</td>
-            <td class="mono">{c.get('license_key') or '-'}</td>
-            <td>{c.get('credit_before')}</td>
-            <td>{c.get('credit_cost')}</td>
-            <td>{c.get('credit_after')}</td>
-        </tr>
-        """
-
-    html = f"""
-<!doctype html>
-<html lang="vi">
-<head>
-    <meta charset="utf-8">
-    <title>Veo Admin Dashboard</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; background:#f1f5f9; padding:24px; color:#0f172a; }}
-        h1 {{ margin-top:0; }}
-        .cards {{ display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin-bottom:20px; }}
-        .card {{ background:white; border-radius:16px; padding:18px; box-shadow:0 8px 22px rgba(15,23,42,.06); }}
-        .num {{ font-size:26px; font-weight:bold; color:#7c3aed; }}
-        table {{ width:100%; border-collapse:collapse; background:white; border-radius:14px; overflow:hidden; margin-bottom:28px; }}
-        th, td {{ padding:10px; border-bottom:1px solid #e2e8f0; text-align:left; font-size:13px; vertical-align: top; }}
-        th {{ background:#e0f2fe; }}
-        .mono {{ font-family:monospace; color:#16a34a; word-break: break-all; }}
-        a {{ color:#2563eb; font-weight:bold; text-decoration:none; }}
-    </style>
-</head>
-<body>
-    <h1>🔐 Veo Admin Dashboard</h1>
-    <p>DB: <b>{'PostgreSQL' if using_postgres() else 'SQLite local'}</b></p>
-
-    <div class="cards">
-        <div class="card"><div>Doanh thu paid</div><div class="num">{format_money(total_revenue)}</div></div>
-        <div class="card"><div>Đơn paid</div><div class="num">{paid_count}</div></div>
-        <div class="card"><div>Đơn pending</div><div class="num">{pending_count}</div></div>
-        <div class="card"><div>License</div><div class="num">{len(licenses)}</div></div>
-        <div class="card"><div>Thiết bị</div><div class="num">{len(devices)}</div></div>
-    </div>
-
-    <h2>Đơn hàng gần đây</h2>
-    <table>
-        <tr><th>Mã đơn</th><th>Email</th><th>Gói</th><th>Số tiền</th><th>Trạng thái</th><th>License</th><th>Thao tác</th></tr>
-        {order_rows}
-    </table>
-
-    <h2>License gần đây</h2>
-    <table>
-        <tr><th>Email</th><th>License</th><th>Gói</th><th>Credit</th><th>Trạng thái</th><th>Hạn dùng</th><th>Thao tác</th></tr>
-        {license_rows}
-    </table>
-
-    <h2>Thiết bị đã kích hoạt</h2>
-    <table>
-        <tr><th>License</th><th>Device ID</th><th>Tên máy</th><th>Trạng thái</th><th>IP</th><th>Last seen</th><th>Thao tác</th></tr>
-        {device_rows}
-    </table>
-
-    <h2>Log đăng nhập</h2>
-    <table>
-        <tr><th>Thời gian</th><th>Email</th><th>Device</th><th>Kết quả</th><th>Lý do</th><th>IP</th></tr>
-        {auth_rows}
-    </table>
-
-    <h2>Log trừ credit</h2>
-    <table>
-        <tr><th>Thời gian</th><th>Email</th><th>License</th><th>Trước</th><th>Trừ</th><th>Sau</th></tr>
-        {credit_rows}
-    </table>
-</body>
-</html>
-"""
-    return html
-
-
-@app.get("/admin/confirm-order-ui")
-def admin_confirm_order_ui(token: str, order_code: str):
-    if not admin_ok(token):
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    mark_order_paid_and_create_license(order_code)
-    return RedirectResponse(url=f"/admin?token={token}")
-
-
-@app.get("/admin/set-license-status")
-def admin_set_license_status(token: str, email: str, license_key: str, status: str):
-    if not admin_ok(token):
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    if status not in ["active", "locked"]:
-        raise HTTPException(status_code=400, detail="Trạng thái không hợp lệ")
-
-    db_execute("""
-    UPDATE licenses
-    SET status = ?
-    WHERE email = ? AND license_key = ?
-    """, (status, email.strip().lower(), license_key.strip()))
-
-    return RedirectResponse(url=f"/admin?token={token}")
-
-
-@app.get("/admin/set-device-status")
-def admin_set_device_status(token: str, license_key: str, device_id: str, status: str):
-    if not admin_ok(token):
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    if status not in ["active", "locked"]:
-        raise HTTPException(status_code=400, detail="Trạng thái không hợp lệ")
-
-    db_execute("""
-    UPDATE license_devices
-    SET status = ?
-    WHERE license_key = ? AND device_id = ?
-    """, (status, license_key.strip(), device_id.strip()))
-
-    return RedirectResponse(url=f"/admin?token={token}")
-
-
-@app.get("/admin/orders")
-def list_orders(x_admin_token: str = Header(default="")):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    rows = db_execute("SELECT * FROM orders ORDER BY id DESC LIMIT 100", fetchall=True)
-    return {"success": True, "orders": rows}
-
-
-@app.post("/admin/confirm-order")
-def confirm_order(data: ConfirmOrderRequest, x_admin_token: str = Header(default="")):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    return mark_order_paid_and_create_license(data.order_code)
-
-
-@app.get("/admin/pay/{order_code}")
-def fake_pay_disabled(order_code: str):
-    # Giai đoạn 1 bảo mật: khóa endpoint fake pay public.
-    # Duyệt thủ công chỉ dùng /admin/confirm-order hoặc dashboard có token.
-    raise HTTPException(status_code=404, detail="Endpoint disabled for security")
-
-
-@app.post("/admin/create-license")
-def create_license(data: CreateLicenseRequest, x_admin_token: str = Header(default="")):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    license_data = create_license_for_order(data.email.strip().lower(), data.plan)
-
-    return {
-        "success": True,
-        **license_data,
-        "price": PLAN_CONFIG[data.plan]["price_text"]
-    }
-
-
-@app.post("/admin/add-credit")
-def add_credit(data: AddCreditRequest, x_admin_token: str = Header(default="")):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    row = db_execute("""
-    SELECT * FROM licenses
-    WHERE email = ? AND license_key = ?
-    """, (data.email.strip().lower(), data.license_key.strip()), fetchone=True)
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Không tìm thấy license")
-
-    new_credit = row["credit"] + data.credit
-
-    db_execute("""
-    UPDATE licenses
-    SET credit = ?
-    WHERE email = ? AND license_key = ?
-    """, (new_credit, data.email.strip().lower(), data.license_key.strip()))
-
-    return {
-        "success": True,
-        "email": data.email,
-        "credit_before": row["credit"],
-        "credit_added": data.credit,
-        "credit_after": new_credit
-    }
-
-
-@app.post("/admin/change-plan")
-def change_plan(data: ChangePlanRequest, x_admin_token: str = Header(default="")):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    if data.plan not in PLAN_CONFIG:
-        raise HTTPException(status_code=400, detail="Gói cước không hợp lệ")
-
-    plan = PLAN_CONFIG[data.plan]
-
-    row = db_execute("""
-    SELECT * FROM licenses
-    WHERE email = ? AND license_key = ?
-    """, (data.email.strip().lower(), data.license_key.strip()), fetchone=True)
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Không tìm thấy license")
-
-    expires_at = datetime.now() + timedelta(days=plan["days"])
-
-    db_execute("""
-    UPDATE licenses
-    SET plan = ?, credit = ?, expires_at = ?, status = ?
-    WHERE email = ? AND license_key = ?
-    """, (
-        data.plan,
-        plan["credit"],
-        expires_at.isoformat(),
-        "active",
-        data.email.strip().lower(),
-        data.license_key.strip()
-    ))
-
-    return {
-        "success": True,
-        "email": data.email,
-        "new_plan": data.plan,
-        "credit": plan["credit"],
-        "expires_at": expires_at.isoformat()
-    }
-
-
-@app.post("/admin/lock")
-def lock_license(data: LoginRequest, x_admin_token: str = Header(default="")):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    db_execute("""
-    UPDATE licenses
-    SET status = 'locked'
-    WHERE email = ? AND license_key = ?
-    """, (data.email.strip().lower(), data.license_key.strip()))
-
-    return {"success": True, "message": "Đã khóa tài khoản"}
-
-
-@app.post("/admin/unlock")
-def unlock_license(data: LoginRequest, x_admin_token: str = Header(default="")):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Sai admin token")
-
-    db_execute("""
-    UPDATE licenses
-    SET status = 'active'
-    WHERE email = ? AND license_key = ?
-    """, (data.email.strip().lower(), data.license_key.strip()))
-
-    return {"success": True, "message": "Đã mở khóa tài khoản"}
-
-
-# =========================================================
-# TOOL LOGIN + USAGE
-# =========================================================
-
-@app.post("/auth/login")
-def login(data: LoginRequest, request: Request):
-    device_id = make_device_id(data.device_id, request)
-
-    row = db_execute("""
-    SELECT * FROM licenses
-    WHERE email = ? AND license_key = ?
-    """, (data.email.strip().lower(), data.license_key.strip()), fetchone=True)
-
-    if not row:
-        log_auth(data.email.strip().lower(), data.license_key.strip(), device_id, request, False, "wrong_email_or_license")
-        raise HTTPException(status_code=401, detail="Email hoặc license key không đúng")
-
-    if row["status"] != "active":
-        log_auth(row["email"], row["license_key"], device_id, request, False, "license_locked")
-        raise HTTPException(status_code=403, detail="Tài khoản đã bị khóa")
-
-    if datetime.fromisoformat(row["expires_at"]) < datetime.now():
-        log_auth(row["email"], row["license_key"], device_id, request, False, "expired")
-        raise HTTPException(status_code=403, detail="Gói cước đã hết hạn")
+@app.post("/license/login")
+def license_login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
+    ip = client_ip(request)
+    ua = request.headers.get("user-agent", "")
 
     try:
-        device_id = bind_or_check_device(row, data, request)
-    except HTTPException as e:
-        log_auth(row["email"], row["license_key"], device_id, request, False, str(e.detail))
+        rate_limit_or_429(db, f"login:{ip}", ip, LOGIN_RATE_LIMIT, 600)
+    except HTTPException:
+        db.add(AuthLog(email=str(data.email), ip=ip, user_agent=ua, status="rate_limited", reason="too many login attempts"))
+        db.commit()
         raise
 
-    plan_info = PLAN_CONFIG.get(row["plan"], {})
-    log_auth(row["email"], row["license_key"], device_id, request, True, "ok")
+    key_hash = hash_license_key(data.license_key)
+    lic = db.query(License).filter(
+        License.email == str(data.email).lower(),
+        License.license_key_hash == key_hash,
+    ).first()
+
+    hwid_hash = hash_hwid(data.hwid)
+
+    if not lic:
+        db.add(AuthLog(email=str(data.email), hwid_hash=hwid_hash, ip=ip, user_agent=ua, status="fail", reason="invalid email or key"))
+        db.commit()
+        raise HTTPException(status_code=401, detail="Invalid email or license key")
+
+    if lic.blocked:
+        db.add(AuthLog(email=lic.email, license_id=lic.id, hwid_hash=hwid_hash, ip=ip, user_agent=ua, status="blocked", reason=lic.block_reason))
+        db.commit()
+        raise HTTPException(status_code=403, detail="License blocked")
+
+    if lic.expires_at < now_utc():
+        db.add(AuthLog(email=lic.email, license_id=lic.id, hwid_hash=hwid_hash, ip=ip, user_agent=ua, status="fail", reason="expired"))
+        db.commit()
+        raise HTTPException(status_code=403, detail="License expired")
+
+    device = db.query(LicenseDevice).filter(
+        LicenseDevice.license_id == lic.id,
+        LicenseDevice.hwid_hash == hwid_hash,
+    ).first()
+
+    if device and device.revoked:
+        db.add(AuthLog(email=lic.email, license_id=lic.id, hwid_hash=hwid_hash, ip=ip, user_agent=ua, status="blocked", reason="device revoked"))
+        db.commit()
+        raise HTTPException(status_code=403, detail="This device has been revoked")
+
+    active_device_count = db.query(LicenseDevice).filter(
+        LicenseDevice.license_id == lic.id,
+        LicenseDevice.revoked == False,
+    ).count()
+
+    if not device:
+        if active_device_count >= lic.max_devices:
+            db.add(AuthLog(email=lic.email, license_id=lic.id, hwid_hash=hwid_hash, ip=ip, user_agent=ua, status="blocked", reason="device limit exceeded"))
+            db.commit()
+            raise HTTPException(status_code=403, detail="Device limit exceeded")
+
+        device = LicenseDevice(
+            license_id=lic.id,
+            hwid_hash=hwid_hash,
+            device_name=data.device_name,
+            first_ip=ip,
+            last_ip=ip,
+        )
+        db.add(device)
+    else:
+        device.last_ip = ip
+        device.last_seen = now_utc()
+        device.device_name = data.device_name or device.device_name
+
+    session_plain_id = secrets.token_urlsafe(32)
+    expires_ts = int(time.time() + SESSION_TTL_HOURS * 3600)
+    sess = ClientSession(
+        session_hash=hash_session(session_plain_id),
+        license_id=lic.id,
+        hwid_hash=hwid_hash,
+        ip=ip,
+        user_agent=ua,
+        expires_at=dt.datetime.utcfromtimestamp(expires_ts),
+    )
+    db.add(sess)
+
+    token_payload = {
+        "sid": session_plain_id,
+        "license_id": lic.id,
+        "email": lic.email,
+        "hwid_hash": hwid_hash,
+        "exp": expires_ts,
+    }
+    token = sign_payload_for_client(token_payload)
+
+    db.add(AuthLog(email=lic.email, license_id=lic.id, hwid_hash=hwid_hash, ip=ip, user_agent=ua, status="success", reason="login ok"))
+    db.commit()
 
     return {
-        "success": True,
-        "email": row["email"],
-        "plan": row["plan"],
-        "plan_name": plan_info.get("name", row["plan"]),
-        "credit": row["credit"],
-        "status": row["status"],
-        "expires_at": row["expires_at"],
-        "concurrent": plan_info.get("concurrent", 1),
-        "prompt_limit": plan_info.get("prompt_limit", 20),
-        "device_id": device_id,
-        "device_limit": plan_info.get("device_limit", 1)
+        "ok": True,
+        "session_token": token,
+        "session_expires_at": sess.expires_at.isoformat(),
+        "license": {
+            "email": lic.email,
+            "plan": lic.plan,
+            "credits": lic.credits,
+            "expires_at": lic.expires_at.isoformat(),
+            "max_devices": lic.max_devices,
+            "device_count": active_device_count if device.id else active_device_count + 1,
+            "blocked": lic.blocked,
+        },
+        "security": {
+            "hwid_bound": True,
+            "anti_share": True,
+            "rate_limit": True,
+        },
     }
-
-
-@app.get("/login")
-def login_get(email: str, license_key: str, request: Request, device_id: Optional[str] = None):
-    req = LoginRequest(email=email, license_key=license_key, device_id=device_id, device_name="Browser test")
-    return login(req, request)
 
 
 @app.post("/usage/check")
-def check_usage(data: ConsumeCreditRequest, request: Request):
-    row = db_execute("""
-    SELECT * FROM licenses
-    WHERE email = ? AND license_key = ?
-    """, (data.email.strip().lower(), data.license_key.strip()), fetchone=True)
-
-    if not row:
-        raise HTTPException(status_code=401, detail="License không hợp lệ")
-
-    if row["status"] != "active":
-        raise HTTPException(status_code=403, detail="Tài khoản đã bị khóa")
-
-    if datetime.fromisoformat(row["expires_at"]) < datetime.now():
-        raise HTTPException(status_code=403, detail="Gói cước đã hết hạn")
-
-    if row["credit"] < data.credit_cost:
-        raise HTTPException(status_code=402, detail="Không đủ credit")
-
+def usage_check(
+    data: UsageCheckIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    lic = verify_session(request, db, authorization, data.hwid)
     return {
-        "success": True,
-        "credit_available": row["credit"],
-        "credit_cost": data.credit_cost,
-        "credit_after": row["credit"] - data.credit_cost
+        "ok": True,
+        "email": lic.email,
+        "plan": lic.plan,
+        "credits": lic.credits,
+        "expires_at": lic.expires_at.isoformat(),
+        "blocked": lic.blocked,
+        "subscription_status": lic.subscription_status,
     }
 
 
 @app.post("/usage/consume")
-def consume_credit(data: ConsumeCreditRequest, request: Request):
-    row = db_execute("""
-    SELECT * FROM licenses
-    WHERE email = ? AND license_key = ?
-    """, (data.email.strip().lower(), data.license_key.strip()), fetchone=True)
+def usage_consume(
+    data: UsageConsumeIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    lic = verify_session(request, db, authorization, data.hwid)
+    ip = client_ip(request)
 
-    if not row:
-        raise HTTPException(status_code=401, detail="License không hợp lệ")
+    rate_limit_or_429(db, f"consume:license:{lic.id}", ip, CONSUME_RATE_LIMIT, 600)
 
-    if row["status"] != "active":
-        raise HTTPException(status_code=403, detail="Tài khoản đã bị khóa")
+    # Idempotency: same request_id should not double-charge.
+    existing_log = db.query(CreditLog).filter(
+        CreditLog.license_id == lic.id,
+        CreditLog.request_id == data.request_id,
+        CreditLog.action == "consume",
+    ).first()
+    if existing_log:
+        return {
+            "ok": True,
+            "idempotent": True,
+            "credits": existing_log.after_credit,
+            "request_id": data.request_id,
+        }
 
-    if datetime.fromisoformat(row["expires_at"]) < datetime.now():
-        raise HTTPException(status_code=403, detail="Gói cước đã hết hạn")
+    if lic.credits < data.credits:
+        raise HTTPException(status_code=402, detail="Not enough credits")
 
-    if row["credit"] < data.credit_cost:
-        raise HTTPException(status_code=402, detail="Không đủ credit")
+    before = lic.credits
+    after = before - data.credits
+    lic.credits = after
+    lic.updated_at = now_utc()
 
-    new_credit = row["credit"] - data.credit_cost
-
-    db_execute("""
-    UPDATE licenses
-    SET credit = ?
-    WHERE email = ? AND license_key = ?
-    """, (new_credit, data.email.strip().lower(), data.license_key.strip()))
-
-    log_credit(row["email"], row["license_key"], row["credit"], data.credit_cost, new_credit, request)
+    log = CreditLog(
+        license_id=lic.id,
+        action="consume",
+        amount=data.credits,
+        before_credit=before,
+        after_credit=after,
+        reason=data.reason,
+        request_id=data.request_id,
+        ip=ip,
+    )
+    db.add(log)
+    db.commit()
 
     return {
-        "success": True,
-        "credit_before": row["credit"],
-        "credit_cost": data.credit_cost,
-        "credit_after": new_credit
+        "ok": True,
+        "credits": after,
+        "used": data.credits,
+        "request_id": data.request_id,
     }
 
 
-# ==============================
-# RUN SERVER (LOCAL)
-# ==============================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
+@app.post("/license/logout")
+def logout(
+    request: Request,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    token = authorization.split(" ", 1)[1].strip()
+    payload = verify_client_token(token)
+    sid = payload.get("sid")
+    sess = db.query(ClientSession).filter(ClientSession.session_hash == hash_session(sid)).first()
+    if sess:
+        sess.revoked = True
+        db.commit()
+    return {"ok": True}
+
+
+@app.post("/license/heartbeat")
+def heartbeat(
+    data: UsageCheckIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    lic = verify_session(request, db, authorization, data.hwid)
+    return {
+        "ok": True,
+        "credits": lic.credits,
+        "expires_at": lic.expires_at.isoformat(),
+        "server_time": now_utc().isoformat(),
+    }
+
+
+# =========================================================
+# USER DASHBOARD
+# =========================================================
+
+@app.get("/user", response_class=HTMLResponse)
+def user_dashboard_login():
+    return """
+    <html><body style="font-family:Arial;max-width:600px;margin:50px auto">
+    <h2>Veo Tool User Dashboard</h2>
+    <form method="get" action="/user/dashboard">
+        <input name="email" placeholder="Email" style="padding:10px;width:95%"><br><br>
+        <input name="license_key" placeholder="License key" style="padding:10px;width:95%"><br><br>
+        <button style="padding:10px 18px">Xem tài khoản</button>
+    </form>
+    </body></html>
+    """
+
+
+@app.get("/user/dashboard", response_class=HTMLResponse)
+def user_dashboard(email: EmailStr, license_key: str, db: Session = Depends(get_db)):
+    lic = db.query(License).filter(
+        License.email == str(email).lower(),
+        License.license_key_hash == hash_license_key(license_key),
+    ).first()
+    if not lic:
+        return HTMLResponse("<h3>Sai email hoặc license key</h3>", status_code=401)
+
+    devices = db.query(LicenseDevice).filter(LicenseDevice.license_id == lic.id).all()
+    logs = db.query(CreditLog).filter(CreditLog.license_id == lic.id).order_by(CreditLog.created_at.desc()).limit(20).all()
+
+    dev_rows = "".join(
+        f"<tr><td>{d.device_name or ''}</td><td>{d.last_ip or ''}</td><td>{d.last_seen}</td><td>{'revoked' if d.revoked else 'active'}</td></tr>"
+        for d in devices
     )
+    log_rows = "".join(
+        f"<tr><td>{l.created_at}</td><td>{l.action}</td><td>{l.amount}</td><td>{l.after_credit}</td><td>{l.reason or ''}</td></tr>"
+        for l in logs
+    )
+    return f"""
+    <html><body style="font-family:Arial;max-width:1000px;margin:40px auto">
+        <h2>Tài khoản Veo Tool</h2>
+        <p>Email: <b>{lic.email}</b></p>
+        <p>Gói: <b>{lic.plan}</b></p>
+        <p>Credit còn lại: <b>{lic.credits}</b> / {lic.total_credits}</p>
+        <p>Hết hạn: <b>{lic.expires_at}</b></p>
+        <p>Trạng thái: <b>{"BLOCKED" if lic.blocked else "ACTIVE"}</b></p>
+        <h3>Thiết bị</h3>
+        <table border="1" cellpadding="8" cellspacing="0">
+            <tr><th>Device</th><th>IP cuối</th><th>Lần cuối</th><th>Status</th></tr>
+            {dev_rows}
+        </table>
+        <h3>Lịch sử credit</h3>
+        <table border="1" cellpadding="8" cellspacing="0">
+            <tr><th>Time</th><th>Action</th><th>Amount</th><th>After</th><th>Reason</th></tr>
+            {log_rows}
+        </table>
+    </body></html>
+    """
+
+
+# =========================================================
+# ADMIN ROUTES
+# =========================================================
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(
+    db: Session = Depends(get_db),
+    _: bool = Depends(require_admin),
+):
+    total_orders = db.query(Order).count()
+    paid_orders = db.query(Order).filter(Order.status == "paid").count()
+    revenue = db.query(func.coalesce(func.sum(Order.amount), 0)).filter(Order.status == "paid").scalar()
+    licenses = db.query(License).order_by(License.created_at.desc()).limit(50).all()
+    orders = db.query(Order).order_by(Order.created_at.desc()).limit(50).all()
+
+    lic_rows = ""
+    for l in licenses:
+        lic_rows += f"""
+        <tr>
+            <td>{l.id}</td><td>{l.email}</td><td>{l.plan}</td><td>{l.credits}</td>
+            <td>{l.expires_at}</td><td>{'BLOCKED' if l.blocked else 'ACTIVE'}</td><td>{l.license_key_hint}</td>
+        </tr>
+        """
+
+    order_rows = ""
+    for o in orders:
+        order_rows += f"""
+        <tr><td>{o.order_code}</td><td>{o.email}</td><td>{o.plan}</td>
+        <td>{money_int(o.amount):,}</td><td>{o.status}</td><td>{o.created_at}</td></tr>
+        """
+
+    return f"""
+    <html><body style="font-family:Arial;max-width:1200px;margin:30px auto">
+        <h1>Admin Dashboard - Phase 2</h1>
+        <p>Orders: <b>{total_orders}</b> | Paid: <b>{paid_orders}</b> | Revenue: <b>{money_int(revenue):,} VND</b></p>
+        <h2>Licenses</h2>
+        <table border="1" cellpadding="7" cellspacing="0">
+            <tr><th>ID</th><th>Email</th><th>Plan</th><th>Credits</th><th>Expires</th><th>Status</th><th>Hint</th></tr>
+            {lic_rows}
+        </table>
+        <h2>Orders</h2>
+        <table border="1" cellpadding="7" cellspacing="0">
+            <tr><th>Order</th><th>Email</th><th>Plan</th><th>Amount</th><th>Status</th><th>Created</th></tr>
+            {order_rows}
+        </table>
+    </body></html>
+    """
+
+
+@app.get("/admin/api/summary")
+def admin_summary(db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    revenue = db.query(func.coalesce(func.sum(Order.amount), 0)).filter(Order.status == "paid").scalar()
+    return {
+        "orders": db.query(Order).count(),
+        "paid_orders": db.query(Order).filter(Order.status == "paid").count(),
+        "licenses": db.query(License).count(),
+        "blocked_licenses": db.query(License).filter(License.blocked == True).count(),
+        "revenue": money_int(revenue),
+        "active_sessions": db.query(ClientSession).filter(
+            ClientSession.revoked == False,
+            ClientSession.expires_at > now_utc(),
+        ).count(),
+    }
+
+
+@app.get("/admin/api/orders")
+def admin_orders(db: Session = Depends(get_db), _: bool = Depends(require_admin), limit: int = 100):
+    rows = db.query(Order).order_by(Order.created_at.desc()).limit(limit).all()
+    return [
+        {
+            "order_code": o.order_code,
+            "email": o.email,
+            "plan": o.plan,
+            "amount": money_int(o.amount),
+            "status": o.status,
+            "created_at": o.created_at.isoformat(),
+            "paid_at": o.paid_at.isoformat() if o.paid_at else None,
+        } for o in rows
+    ]
+
+
+@app.get("/admin/api/licenses")
+def admin_licenses(db: Session = Depends(get_db), _: bool = Depends(require_admin), limit: int = 100):
+    rows = db.query(License).order_by(License.created_at.desc()).limit(limit).all()
+    return [
+        {
+            "id": l.id,
+            "email": l.email,
+            "plan": l.plan,
+            "credits": l.credits,
+            "total_credits": l.total_credits,
+            "max_devices": l.max_devices,
+            "expires_at": l.expires_at.isoformat(),
+            "blocked": l.blocked,
+            "block_reason": l.block_reason,
+            "license_key_hint": l.license_key_hint,
+            "subscription_status": l.subscription_status,
+        } for l in rows
+    ]
+
+
+@app.post("/admin/api/block")
+def admin_block(data: AdminBlockIn, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    lic = db.query(License).filter(License.id == data.license_id).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+    lic.blocked = data.blocked
+    lic.block_reason = data.reason
+    db.commit()
+    return {"ok": True, "license_id": lic.id, "blocked": lic.blocked}
+
+
+@app.post("/admin/api/credit")
+def admin_credit(data: AdminCreditIn, request: Request, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    lic = db.query(License).filter(License.id == data.license_id).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+    before = lic.credits
+    after = before + data.amount
+    if after < 0:
+        raise HTTPException(status_code=400, detail="Credit cannot be negative")
+    lic.credits = after
+    lic.total_credits = max(lic.total_credits, after)
+    db.add(CreditLog(
+        license_id=lic.id,
+        action="add" if data.amount >= 0 else "consume",
+        amount=abs(data.amount),
+        before_credit=before,
+        after_credit=after,
+        reason=data.reason,
+        request_id="admin-" + str(uuid.uuid4()),
+        ip=client_ip(request),
+    ))
+    db.commit()
+    return {"ok": True, "before": before, "after": after}
+
+
+@app.get("/admin/api/devices/{license_id}")
+def admin_devices(license_id: int, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    rows = db.query(LicenseDevice).filter(LicenseDevice.license_id == license_id).all()
+    return [
+        {
+            "id": d.id,
+            "device_name": d.device_name,
+            "first_ip": d.first_ip,
+            "last_ip": d.last_ip,
+            "first_seen": d.first_seen.isoformat(),
+            "last_seen": d.last_seen.isoformat(),
+            "trusted": d.trusted,
+            "revoked": d.revoked,
+        } for d in rows
+    ]
+
+
+@app.post("/admin/api/device/revoke")
+def admin_revoke_device(data: AdminDeviceRevokeIn, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    dev = db.query(LicenseDevice).filter(LicenseDevice.id == data.device_id).first()
+    if not dev:
+        raise HTTPException(status_code=404, detail="Device not found")
+    dev.revoked = data.revoked
+
+    # revoke all sessions of this device
+    sessions = db.query(ClientSession).filter(
+        ClientSession.license_id == dev.license_id,
+        ClientSession.hwid_hash == dev.hwid_hash,
+    ).all()
+    for s in sessions:
+        s.revoked = True
+    db.commit()
+    return {"ok": True, "device_id": dev.id, "revoked": dev.revoked}
+
+
+@app.post("/admin/api/order/{order_code}/mark-paid")
+def admin_mark_paid(order_code: str, db: Session = Depends(get_db), _: bool = Depends(require_admin)):
+    order = mark_order_paid(db, order_code, {"source": "admin_manual_mark_paid"})
+    return {"ok": True, "order_code": order.order_code, "status": order.status}
+
+
+# =========================================================
+# CLIENT HELPER: HWID EXAMPLE
+# =========================================================
+
+@app.get("/client/hwid-example.py", response_class=PlainTextResponse)
+def hwid_example():
+    return r
